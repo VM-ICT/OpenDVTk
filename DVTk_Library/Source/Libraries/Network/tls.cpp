@@ -29,12 +29,139 @@
 #include <sstream>
 #include <string>
 #include "tls.h"
+#include <iostream>
 
 using std::string;
 
 #define SSTR( x ) dynamic_cast< std::ostringstream & >( \
         ( std::ostringstream() << std::dec << x ) ).str()
 
+//////////////////////////////////////////////////////////////////////////////////
+//TODO:: Below declerations should be in another file
+VERIFY_CB_ARGS verify_args = { -1, 0, X509_V_OK, 0 };
+
+static STRINT_PAIR ssl_versions[] = {
+	{"SSL 3.0", SSL3_VERSION},
+	{"TLS 1.0", TLS1_VERSION},
+	{"TLS 1.1", TLS1_1_VERSION},
+	{"TLS 1.2", TLS1_2_VERSION},
+	{"TLS 1.3", TLS1_3_VERSION},
+	{"DTLS 1.0", DTLS1_VERSION},
+	{"DTLS 1.0 (bad)", DTLS1_BAD_VER},
+	{NULL}
+};
+
+static const char* lookup(int val, const STRINT_PAIR* list, const char* def)
+{
+	for (; list->name; ++list)
+		if (list->retval == val)
+			return list->name;
+	return def;
+}
+
+static STRINT_PAIR alert_types[] = {
+	{" close_notify", 0},
+	{" end_of_early_data", 1},
+	{" unexpected_message", 10},
+	{" bad_record_mac", 20},
+	{" decryption_failed", 21},
+	{" record_overflow", 22},
+	{" decompression_failure", 30},
+	{" handshake_failure", 40},
+	{" bad_certificate", 42},
+	{" unsupported_certificate", 43},
+	{" certificate_revoked", 44},
+	{" certificate_expired", 45},
+	{" certificate_unknown", 46},
+	{" illegal_parameter", 47},
+	{" unknown_ca", 48},
+	{" access_denied", 49},
+	{" decode_error", 50},
+	{" decrypt_error", 51},
+	{" export_restriction", 60},
+	{" protocol_version", 70},
+	{" insufficient_security", 71},
+	{" internal_error", 80},
+	{" inappropriate_fallback", 86},
+	{" user_canceled", 90},
+	{" no_renegotiation", 100},
+	{" missing_extension", 109},
+	{" unsupported_extension", 110},
+	{" certificate_unobtainable", 111},
+	{" unrecognized_name", 112},
+	{" bad_certificate_status_response", 113},
+	{" bad_certificate_hash_value", 114},
+	{" unknown_psk_identity", 115},
+	{" certificate_required", 116},
+	{NULL}
+};
+
+static STRINT_PAIR handshakes[] = {
+	{", HelloRequest", SSL3_MT_HELLO_REQUEST},
+	{", ClientHello", SSL3_MT_CLIENT_HELLO},
+	{", ServerHello", SSL3_MT_SERVER_HELLO},
+	{", HelloVerifyRequest", DTLS1_MT_HELLO_VERIFY_REQUEST},
+	{", NewSessionTicket", SSL3_MT_NEWSESSION_TICKET},
+	{", EndOfEarlyData", SSL3_MT_END_OF_EARLY_DATA},
+	{", EncryptedExtensions", SSL3_MT_ENCRYPTED_EXTENSIONS},
+	{", Certificate", SSL3_MT_CERTIFICATE},
+	{", ServerKeyExchange", SSL3_MT_SERVER_KEY_EXCHANGE},
+	{", CertificateRequest", SSL3_MT_CERTIFICATE_REQUEST},
+	{", ServerHelloDone", SSL3_MT_SERVER_DONE},
+	{", CertificateVerify", SSL3_MT_CERTIFICATE_VERIFY},
+	{", ClientKeyExchange", SSL3_MT_CLIENT_KEY_EXCHANGE},
+	{", Finished", SSL3_MT_FINISHED},
+	{", CertificateUrl", SSL3_MT_CERTIFICATE_URL},
+	{", CertificateStatus", SSL3_MT_CERTIFICATE_STATUS},
+	{", SupplementalData", SSL3_MT_SUPPLEMENTAL_DATA},
+	{", KeyUpdate", SSL3_MT_KEY_UPDATE},
+#ifndef OPENSSL_NO_NEXTPROTONEG
+	{", NextProto", SSL3_MT_NEXT_PROTO},
+#endif
+	{", MessageHash", SSL3_MT_MESSAGE_HASH},
+	{NULL}
+};
+
+BIO* bio_in = NULL;
+BIO* bio_out = NULL;
+BIO* bio_err = NULL;
+
+static void nodes_print(const char* name, STACK_OF(X509_POLICY_NODE)* nodes)
+{
+	X509_POLICY_NODE* node;
+	int i;
+
+	BIO_printf(bio_err, "%s Policies:", name);
+	if (nodes) {
+		BIO_puts(bio_err, "\n");
+		for (i = 0; i < sk_X509_POLICY_NODE_num(nodes); i++) {
+			node = sk_X509_POLICY_NODE_value(nodes, i);
+			X509_POLICY_NODE_print(bio_err, node, 2);
+		}
+	}
+	else {
+		BIO_puts(bio_err, " <empty>\n");
+	}
+}
+
+void policies_print(X509_STORE_CTX* ctx)
+{
+	X509_POLICY_TREE* tree;
+	int explicit_policy;
+	tree = X509_STORE_CTX_get0_policy_tree(ctx);
+	explicit_policy = X509_STORE_CTX_get_explicit_policy(ctx);
+
+	BIO_printf(bio_err, "Require explicit Policy: %s\n",
+		explicit_policy ? "True" : "False");
+
+	nodes_print("Authority", X509_policy_tree_get0_policies(tree));
+	nodes_print("User", X509_policy_tree_get0_user_policies(tree));
+}
+
+
+
+
+////////////////////////////////////////////////////////////////////////////////////////
 //>>===========================================================================
 
 TLS_SOCKET_CLASS::TLS_SOCKET_CLASS()
@@ -51,7 +178,8 @@ TLS_SOCKET_CLASS::TLS_SOCKET_CLASS()
 	listeningM = false;
 	terminatingM = false;
 	certificateFilePasswordM = DEFAULT_CERTIFICATE_FILE_PASSWORD;
-	tlsVersionM = DEFAULT_TLS_VERSION;
+	maxTlsVersionM = DEFAULT_TLS_VERSION;
+	minTlsVersionM = DEFAULT_TLS_VERSION;
 	checkRemoteCertificateM = true;
 	cipherListM = DEFAULT_CIPHER_LIST;
 	cacheTlsSessionsM = true;
@@ -81,7 +209,8 @@ TLS_SOCKET_CLASS::TLS_SOCKET_CLASS(const TLS_SOCKET_CLASS& socket) : BASE_SOCKET
 	listeningM = socket.listeningM;
 	terminatingM = socket.terminatingM;
 	certificateFilePasswordM = socket.certificateFilePasswordM;
-	tlsVersionM = socket.tlsVersionM;
+	maxTlsVersionM = socket.maxTlsVersionM;
+	minTlsVersionM = socket.minTlsVersionM;
 	checkRemoteCertificateM = socket.checkRemoteCertificateM;
 	cipherListM = socket.cipherListM;
 	cacheTlsSessionsM = socket.cacheTlsSessionsM;
@@ -93,7 +222,10 @@ TLS_SOCKET_CLASS::TLS_SOCKET_CLASS(const TLS_SOCKET_CLASS& socket) : BASE_SOCKET
 	savedClientSessionM_ptr = socket.savedClientSessionM_ptr;
 
 	ctxM_ptr = socket.ctxM_ptr;
-	CRYPTO_add(&ctxM_ptr->references,1,CRYPTO_LOCK_SSL_CTX);
+
+	// TODO:: Find new way to lock
+	// prev. CRYPTO_add(&ctxM_ptr->references,1,CRYPTO_LOCK_SSL_CTX);
+	SSL_CTX_up_ref(ctxM_ptr);
 
 	if (sslM_ptr != NULL)
 	{
@@ -120,7 +252,8 @@ TLS_SOCKET_CLASS::TLS_SOCKET_CLASS(const SOCKET_PARAMETERS& socketParams, LOG_CL
 	listeningM = false;
 	terminatingM = false;
 	certificateFilePasswordM = socketParams.certificateFilePasswordM;
-	tlsVersionM = socketParams.tlsVersionM;
+	maxTlsVersionM = socketParams.maxTlsVersionM;
+	minTlsVersionM = socketParams.minTlsVersionM;
 	checkRemoteCertificateM = socketParams.checkRemoteCertificateM;
 	cipherListM = socketParams.cipherListM;
 	cacheTlsSessionsM = socketParams.cacheTlsSessionsM;
@@ -131,7 +264,8 @@ TLS_SOCKET_CLASS::TLS_SOCKET_CLASS(const SOCKET_PARAMETERS& socketParams, LOG_CL
 	sslM_ptr = NULL;
 	acceptBioM_ptr = NULL;
 	savedClientSessionM_ptr = NULL;
-
+	//enable logs
+	//loggerM_ptr->setLogMask(LOG_INFO | LOG_ERROR);
 	openSslInitialize();
 }
 		
@@ -151,7 +285,8 @@ TLS_SOCKET_CLASS::TLS_SOCKET_CLASS(const TLS_SOCKET_CLASS& socket, SSL* newSsl_p
 	listeningM = false;
 	terminatingM = false;
 	certificateFilePasswordM = socket.certificateFilePasswordM;
-	tlsVersionM = socket.tlsVersionM;
+	maxTlsVersionM = socket.maxTlsVersionM;
+	minTlsVersionM = socket.minTlsVersionM;
 	checkRemoteCertificateM = socket.checkRemoteCertificateM;
 	cipherListM = socket.cipherListM;
 	cacheTlsSessionsM = socket.cacheTlsSessionsM;
@@ -163,7 +298,10 @@ TLS_SOCKET_CLASS::TLS_SOCKET_CLASS(const TLS_SOCKET_CLASS& socket, SSL* newSsl_p
 	savedClientSessionM_ptr = NULL;
 
 	ctxM_ptr = socket.ctxM_ptr;
-	CRYPTO_add(&ctxM_ptr->references,1,CRYPTO_LOCK_SSL_CTX);
+	
+	// TODO:: Find new way to lock
+	// prev. CRYPTO_add(&ctxM_ptr->references,1,CRYPTO_LOCK_SSL_CTX);
+	SSL_CTX_up_ref(ctxM_ptr);
 
 	if (sslM_ptr != NULL)
 	{
@@ -198,11 +336,12 @@ TLS_SOCKET_CLASS::~TLS_SOCKET_CLASS()
 	// free the CTX
 	if (ctxM_ptr != NULL)
 	{
-		if (ctxM_ptr->references == 1)
-		{
-			// the ctx structure will be freed, delete the password memory
-			delete [] (char*)ctxM_ptr->default_passwd_callback_userdata;
-		}
+		// prev. No need to do this in new version
+		//if (ctxM_ptr->references == 1)
+		//{
+		//	// the ctx structure will be freed, delete the password memory
+		//	delete [] (char*)ctxM_ptr->default_passwd_callback_userdata;
+		//}
 
 		SSL_CTX_free(ctxM_ptr); // this will decrement the reference count and delete the structure if 0
 	}
@@ -227,7 +366,8 @@ bool TLS_SOCKET_CLASS::socketParametersChanged(const SOCKET_PARAMETERS& socketPa
 	}
 
 	if ((certificateFilePasswordM == socketParams.certificateFilePasswordM) &&
-		(tlsVersionM == socketParams.tlsVersionM) &&
+		(maxTlsVersionM == socketParams.maxTlsVersionM) &&
+		(minTlsVersionM == socketParams.minTlsVersionM) &&
 		(checkRemoteCertificateM == socketParams.checkRemoteCertificateM) &&
 		(cipherListM == socketParams.cipherListM) &&
 		(cacheTlsSessionsM == socketParams.cacheTlsSessionsM) &&
@@ -271,14 +411,19 @@ bool TLS_SOCKET_CLASS::openSslInitialize()
 		return false;
 	}
 
-	// setup the connection factory for this session
+	/*// setup the connection factory for this session
 	if (tlsVersionM == TLS_VERSION_TLSv1)
 	{
 		ctxM_ptr = SSL_CTX_new(TLSv1_method());
 	}
 	else if (tlsVersionM == TLS_VERSION_SSLv3)
 	{
-		ctxM_ptr = SSL_CTX_new(SSLv3_method());
+		//openssl Notes
+		//A TLS/SSL connection established with these methods will only understand the SSLv3 protocol. 
+		// The SSLv3 protocol is deprecated and should not be used.
+		// ctxM_ptr = SSL_CTX_new(SSLv3_method());
+		openSslError("initializing connection factory with SSLv3");
+		return false;
 	}
 	else
 	{
@@ -289,7 +434,56 @@ bool TLS_SOCKET_CLASS::openSslInitialize()
 	{
 		openSslError("initializing connection factory");
 		return false;
+	}*/
+	ctxM_ptr = SSL_CTX_new(TLS_method());
+	if (minTlsVersionM == TLS_VERSION_TLSv1)
+	{
+		SSL_CTX_set_min_proto_version(ctxM_ptr, TLS1_VERSION);
+		loggerM_ptr->text(LOG_INFO, 1, "min tlsv 1.0");
 	}
+	else if (minTlsVersionM == TLS_VERSION_TLSv1_1)
+	{
+		SSL_CTX_set_min_proto_version(ctxM_ptr, TLS1_1_VERSION);
+		loggerM_ptr->text(LOG_INFO, 1, "min tlsv 1.1");
+	}
+	else if (minTlsVersionM == TLS_VERSION_TLSv1_2)
+	{
+		SSL_CTX_set_min_proto_version(ctxM_ptr, TLS1_2_VERSION);
+		loggerM_ptr->text(LOG_INFO, 1, "min tlsv 1.2");
+	}
+	else if (minTlsVersionM == TLS_VERSION_TLSv1_3)
+	{
+		SSL_CTX_set_min_proto_version(ctxM_ptr, TLS1_3_VERSION);
+		loggerM_ptr->text(LOG_INFO, 1, "min tlsv 1.3");
+	}
+	else
+		openSslError("unidentified minimum tls version");
+
+	if (maxTlsVersionM == TLS_VERSION_TLSv1)
+	{
+		loggerM_ptr->text(LOG_INFO, 1, "max tlsv 1.0");
+		SSL_CTX_set_max_proto_version(ctxM_ptr, TLS1_VERSION);
+	}
+	else if (maxTlsVersionM == TLS_VERSION_TLSv1_1)
+	{
+		loggerM_ptr->text(LOG_INFO, 1, "max tlsv 1.1");
+		SSL_CTX_set_max_proto_version(ctxM_ptr, TLS1_1_VERSION);
+	}
+	else if (maxTlsVersionM == TLS_VERSION_TLSv1_2)
+	{
+		loggerM_ptr->text(LOG_INFO, 1, "max tlsv 1.2");
+		SSL_CTX_set_max_proto_version(ctxM_ptr, TLS1_2_VERSION);
+	}
+	else if (maxTlsVersionM == TLS_VERSION_TLSv1_3)
+	{
+		loggerM_ptr->text(LOG_INFO, 1, "max tlsv 1.3");
+		SSL_CTX_set_max_proto_version(ctxM_ptr, TLS1_3_VERSION);
+	}
+	else
+		openSslError("unidentified max tls version");
+
+	SSL_CTX_set_security_level(ctxM_ptr, 0);
+
 
 	SSL_CTX_set_default_passwd_cb(ctxM_ptr, OPENSSL_CLASS::openSslPasswordCallback);
 	char *password = new char[certificateFilePasswordM.length() + 1]; // create a buffer to store the password
@@ -328,7 +522,8 @@ bool TLS_SOCKET_CLASS::openSslInitialize()
 	}
 
 	ssl_options = SSL_OP_ALL | SSL_OP_SINGLE_DH_USE;
-	if (tlsVersionM.find(TLS_VERSION_SSLv2) == string::npos)
+	/*if (tlsVersionM.find(TLS_VERSION_SSLv2
+	) == string::npos)
 	{
 		ssl_options |= SSL_OP_NO_SSLv2;
 	}
@@ -339,7 +534,7 @@ bool TLS_SOCKET_CLASS::openSslInitialize()
 	if (tlsVersionM.find(TLS_VERSION_TLSv1) == string::npos)
 	{
 		ssl_options |= SSL_OP_NO_TLSv1;
-	}
+	}*/
 
 	SSL_CTX_set_options(ctxM_ptr, ssl_options);
 
@@ -354,14 +549,17 @@ bool TLS_SOCKET_CLASS::openSslInitialize()
 		SSL_CTX_set_session_cache_mode(ctxM_ptr, SSL_SESS_CACHE_OFF);
 	}
 
-	SSL_CTX_set_tmp_dh_callback(ctxM_ptr, OPENSSL_CLASS::tmpDhCallback);
+	//No need tmpDhCallback
+	SSL_CTX_set_ecdh_auto(ctxM_ptr, 1);   // new: auto enable ecdh curves, this generates dh parameters automatically no need cb
+	//SSL_CTX_set_tmp_dh_callback(ctxM_ptr, OPENSSL_CLASS::tmpDhCallback);
 
-	if (SSL_CTX_set_cipher_list(ctxM_ptr, cipherListM.c_str()) != 1)
-	{
-		cipherListM = "aRSA+kRSA+SHA1+3DES:@STRENGTH:-SSLv2";
-		SSL_CTX_set_cipher_list(ctxM_ptr, cipherListM.c_str());
-		openSslError("initializing cipher list (no valid ciphers)");
-	}
+	// prev. for now lets use defualt ciphers
+	//if (SSL_CTX_set_cipher_list(ctxM_ptr, cipherListM.c_str()) != 1)
+	//{
+	//	cipherListM = "aRSA+kRSA+SHA1+3DES:@STRENGTH:-SSLv2";
+	//	SSL_CTX_set_cipher_list(ctxM_ptr, cipherListM.c_str());
+	//	openSslError("initializing cipher list (no valid ciphers)");
+	//}
 	
 	return true;
 }
@@ -386,18 +584,23 @@ bool TLS_SOCKET_CLASS::readCredentials(SSL_CTX* ctx_ptr)
 	EVP_PKEY* dsaPrivateKey_ptr;
 	STACK_OF(X509)* dsaCertChain_ptr;
 
+
 	// clear the current certificate list
-	if (ctx_ptr->extra_certs != NULL) 
-	{
-		sk_X509_pop_free(ctx_ptr->extra_certs, X509_free);
-		ctx_ptr->extra_certs = NULL;
-	}
+	SSL_CTX_clear_extra_chain_certs(ctx_ptr);
+	// prev. dereferencing SSL_CTX pointer is deprecated
+	//if (ctx_ptr->extra_certs != NULL) 
+	//{
+	//	
+	//	sk_X509_pop_free(ctx_ptr->extra_certs, X509_free);
+	//	ctx_ptr->extra_certs = NULL;
+	//
+	//}
 
 	// read the credentials file
 	openSslM_ptr->readCredentialsFile(credentialsFilenameM.c_str(), 
 		&rsaPrivateKey_ptr, &rsaCertChain_ptr,
 		&dsaPrivateKey_ptr, &dsaCertChain_ptr,
-		ctx_ptr->default_passwd_callback, ctx_ptr->default_passwd_callback_userdata, loggerM_ptr);
+		SSL_CTX_get_default_passwd_cb(ctx_ptr), SSL_CTX_get_default_passwd_cb(ctx_ptr), loggerM_ptr);
 
 	if (rsaPrivateKey_ptr != NULL)
 	{
@@ -473,8 +676,16 @@ end:
 	if (certificate_ptr != NULL) X509_free(certificate_ptr);
 	if (rsaPrivateKey_ptr != NULL) EVP_PKEY_free(rsaPrivateKey_ptr);
 	if (dsaPrivateKey_ptr != NULL) EVP_PKEY_free(dsaPrivateKey_ptr);
-	if (rsaCertChain_ptr != NULL) sk_X509_pop_free(rsaCertChain_ptr, X509_free);
-	if (dsaCertChain_ptr != NULL) sk_X509_pop_free(dsaCertChain_ptr, X509_free);
+	//if (rsaCertChain_ptr != NULL) sk_X509_pop_free(rsaCertChain_ptr, X509_free);
+	if (rsaCertChain_ptr != NULL && (OPENSSL_sk_num((const OPENSSL_STACK*)rsaCertChain_ptr) > 0)) 
+		sk_X509_pop_free(rsaCertChain_ptr, X509_free);
+	else if (rsaCertChain_ptr != NULL) 
+		OPENSSL_sk_free((OPENSSL_STACK*)rsaCertChain_ptr);
+	//if (dsaCertChain_ptr != NULL) sk_X509_pop_free(dsaCertChain_ptr, X509_free);
+	if (dsaCertChain_ptr != NULL && (OPENSSL_sk_num((const OPENSSL_STACK*)dsaCertChain_ptr) > 0))
+		sk_X509_pop_free(dsaCertChain_ptr, X509_free);
+	else if (dsaCertChain_ptr != NULL)
+		OPENSSL_sk_free((OPENSSL_STACK*)dsaCertChain_ptr);
 
 	return ret;
 }
@@ -712,7 +923,8 @@ bool TLS_SOCKET_CLASS::listen()
 	// create the socket
 	listenPort << localListenPortM;
 
-	std::string port = SSTR( localListenPortM );
+	// prev. SSTR( localListenPortM );
+	std::string port = std::to_string(localListenPortM);
 
 	char *ipadress = "0.0.0.0:";
 	char buffer[256]; // <- danger, only storage for 256 characters.
@@ -913,6 +1125,11 @@ void TLS_SOCKET_CLASS::close()
 //  NOTES           :
 //<<===========================================================================
 {
+	if (ERR_peek_error() != 0)
+	{
+		openSslInfo("previous errors from socket closed");
+	}
+	
 	if (ownerThreadIdM != getThreadId())
 	{
 		// this thread does not own the socket, just set the terminatng flag and let the owning 
@@ -1401,31 +1618,97 @@ INT	TLS_SOCKET_CLASS::readBinary(BYTE *buffer_ptr, UINT length)
 
 
 //>>===========================================================================
+// prev. X509_STORE_CTX pointer do not have userdata in new library.
+// TODO:: Log featuer will be implementations will be added in the future for future verify
+//int TLS_SOCKET_CLASS::openSslVerifyCallback (int ok, X509_STORE_CTX* store_ptr)
+//
+////  DESCRIPTION     : Callback OpenSSL uses to request further verification of the received 
+////					  certificate.  This is static function used to call the correct instantiated method.
+////  PRECONDITIONS   :
+////  POSTCONDITIONS  :
+////  EXCEPTIONS      : 
+////  NOTES           : 
+////<<===========================================================================
+//{
+//	if (store_ptr->userdata)
+//	{
+//		// convert to the object method
+//		return static_cast<TLS_SOCKET_CLASS*>(store_ptr->userdata)->verifyCertificate(ok, store_ptr);
+//	}
+//	else
+//	{
+//		// no logger pointer to report an error
+//		return 0;
+//	}
+//}
 
-int TLS_SOCKET_CLASS::openSslVerifyCallback(int ok, X509_STORE_CTX* store_ptr)
+int TLS_SOCKET_CLASS::openSslVerifyCallback(int ok, X509_STORE_CTX* ctx) {
 
-//  DESCRIPTION     : Callback OpenSSL uses to request further verification of the received 
-//					  certificate.  This is static function used to call the correct instantiated method.
-//  PRECONDITIONS   :
-//  POSTCONDITIONS  :
-//  EXCEPTIONS      : 
-//  NOTES           : 
-//<<===========================================================================
-{
-	if (store_ptr->userdata)
-	{
-		// convert to the object method
-		return static_cast<TLS_SOCKET_CLASS*>(store_ptr->userdata)->verifyCertificate(ok, store_ptr);
+	X509* err_cert;
+	int err, depth;
+
+	err_cert = X509_STORE_CTX_get_current_cert(ctx);
+	err = X509_STORE_CTX_get_error(ctx);
+	depth = X509_STORE_CTX_get_error_depth(ctx);
+
+	if (!verify_args.quiet || !ok) {
+		BIO_printf(bio_err, "depth=%d ", depth);
+		if (err_cert != NULL) {
+			X509_NAME_print_ex(bio_err,
+				X509_get_subject_name(err_cert),
+				0, XN_FLAG_ONELINE);
+			BIO_puts(bio_err, "\n");
+		}
+		else {
+			BIO_puts(bio_err, "<no cert>\n");
+		}
 	}
-	else
-	{
-		// no logger pointer to report an error
-		return 0;
+	if (!ok) {
+		BIO_printf(bio_err, "verify error:num=%d:%s\n", err,
+			X509_verify_cert_error_string(err));
+		if (verify_args.depth < 0 || verify_args.depth >= depth) {
+			if (!verify_args.return_error)
+				ok = 1;
+			verify_args.error = err;
+		}
+		else {
+			ok = 0;
+			verify_args.error = X509_V_ERR_CERT_CHAIN_TOO_LONG;
+		}
 	}
+	switch (err) {
+	case X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT:
+		BIO_puts(bio_err, "issuer= ");
+		X509_NAME_print_ex(bio_err, X509_get_issuer_name(err_cert),
+			0, XN_FLAG_ONELINE);
+		BIO_puts(bio_err, "\n");
+		break;
+	case X509_V_ERR_CERT_NOT_YET_VALID:
+	case X509_V_ERR_ERROR_IN_CERT_NOT_BEFORE_FIELD:
+		BIO_printf(bio_err, "notBefore=");
+		ASN1_TIME_print(bio_err, X509_get0_notBefore(err_cert));
+		BIO_printf(bio_err, "\n");
+		break;
+	case X509_V_ERR_CERT_HAS_EXPIRED:
+	case X509_V_ERR_ERROR_IN_CERT_NOT_AFTER_FIELD:
+		BIO_printf(bio_err, "notAfter=");
+		ASN1_TIME_print(bio_err, X509_get0_notAfter(err_cert));
+		BIO_printf(bio_err, "\n");
+		break;
+	case X509_V_ERR_NO_EXPLICIT_POLICY:
+		if (!verify_args.quiet)
+			policies_print(ctx);
+		break;
+	}
+	if (err == X509_V_OK && ok == 2 && !verify_args.quiet)
+		policies_print(ctx);
+	if (ok && !verify_args.quiet)
+		BIO_printf(bio_err, "verify return:%d\n", ok);
+	return ok;
 }
-
 //>>===========================================================================
-
+//prev. this function is not used in the latest version but kept for the future look 
+// This function implemented in openSslVerifyCallback function
 int TLS_SOCKET_CLASS::verifyCertificate(int ok, X509_STORE_CTX* store_ptr)
 
 //  DESCRIPTION     : Instantiated method used by the OpenSSL callback to request further 
@@ -1536,122 +1819,34 @@ void TLS_SOCKET_CLASS::messageCallback(int write_p, int version, int content_typ
 //  NOTES           : This code comes from the OpenSSL apps\s_cb.c function msg_cb()
 //<<===========================================================================
 {
-	const char *str_write_p, *str_version, *str_content_type = "", *str_details1 = "", *str_details2= "";
-
 	if ((loggerM_ptr == NULL) || ((loggerM_ptr->getLogMask() & LOG_DEBUG) == 0))
 	{
 		// not logging debug
 		return;
 	}
-	
-	if (write_p)
-	{
-		str_write_p = "Secure Socket - sent handshake message";
-	}
-	else
-	{
-		str_write_p = "Secure Socket - received handshake message";
-	}
+	const char* str_write_p = write_p ? ">>>" : "<<<";
+	char tmpbuf[128];
+	const char* str_version, * str_content_type = "", * str_details1 = "", * str_details2 = "";
+	const unsigned char* bp = static_cast<const unsigned char*>(buf);
 
-	switch (version)
-	{
-	case SSL2_VERSION:
-		str_version = "SSL 2.0";
-		break;
-	case SSL3_VERSION:
-		str_version = "SSL 3.0 ";
-		break;
-	case TLS1_VERSION:
-		str_version = "TLS 1.0 ";
-		break;
-	default:
-		str_version = "???";
-	}
-
-	if (version == SSL2_VERSION)
-	{
-		str_details1 = "???";
-
-		if (len > 0)
-		{
-			switch (((unsigned char*)buf)[0])
-			{
-				case 0:
-					str_details1 = ", ERROR:";
-					str_details2 = " ???";
-					if (len >= 3)
-					{
-						unsigned err = (((unsigned char*)buf)[1]<<8) + ((unsigned char*)buf)[2];
-						
-						switch (err)
-						{
-						case 0x0001:
-							str_details2 = " NO-CIPHER-ERROR";
-							break;
-						case 0x0002:
-							str_details2 = " NO-CERTIFICATE-ERROR";
-							break;
-						case 0x0004:
-							str_details2 = " BAD-CERTIFICATE-ERROR";
-							break;
-						case 0x0006:
-							str_details2 = " UNSUPPORTED-CERTIFICATE-TYPE-ERROR";
-							break;
-						}
-					}
-
-					break;
-				case 1:
-					str_details1 = ", CLIENT-HELLO";
-					break;
-				case 2:
-					str_details1 = ", CLIENT-MASTER-KEY";
-					break;
-				case 3:
-					str_details1 = ", CLIENT-FINISHED";
-					break;
-				case 4:
-					str_details1 = ", SERVER-HELLO";
-					break;
-				case 5:
-					str_details1 = ", SERVER-VERIFY";
-					break;
-				case 6:
-					str_details1 = ", SERVER-FINISHED";
-					break;
-				case 7:
-					str_details1 = ", REQUEST-CERTIFICATE";
-					break;
-				case 8:
-					str_details1 = ", CLIENT-CERTIFICATE";
-					break;
-			}
-		}
-	}
-
-	if (version == SSL3_VERSION || version == TLS1_VERSION)
-	{
-		switch (content_type)
-		{
-		case 20:
-			str_content_type = "ChangeCipherSpec";
+	if (version == SSL3_VERSION ||
+		version == TLS1_VERSION ||
+		version == TLS1_1_VERSION ||
+		version == TLS1_2_VERSION ||
+		version == TLS1_3_VERSION ||
+		version == DTLS1_VERSION || version == DTLS1_BAD_VER) {
+		str_version = lookup(version, ssl_versions, "???");
+		switch (content_type) {
+		case SSL3_RT_CHANGE_CIPHER_SPEC:
+			/* type 20 */
+			str_content_type = ", ChangeCipherSpec";
 			break;
-		case 21:
-			str_content_type = "Alert";
-			break;
-		case 22:
-			str_content_type = "Handshake";
-			break;
-		}
-
-		if (content_type == 21) /* Alert */
-		{
+		case SSL3_RT_ALERT:
+			/* type 21 */
+			str_content_type = ", Alert";
 			str_details1 = ", ???";
-			
-			if (len == 2)
-			{
-				switch (((unsigned char*)buf)[0])
-				{
+			if (len == 2) {
+				switch (bp[0]) {
 				case 1:
 					str_details1 = ", warning";
 					break;
@@ -1659,124 +1854,36 @@ void TLS_SOCKET_CLASS::messageCallback(int write_p, int version, int content_typ
 					str_details1 = ", fatal";
 					break;
 				}
-
-				str_details2 = " ???";
-				switch (((unsigned char*)buf)[1])
-				{
-				case 0:
-					str_details2 = " close_notify";
-					break;
-				case 10:
-					str_details2 = " unexpected_message";
-					break;
-				case 20:
-					str_details2 = " bad_record_mac";
-					break;
-				case 21:
-					str_details2 = " decryption_failed";
-					break;
-				case 22:
-					str_details2 = " record_overflow";
-					break;
-				case 30:
-					str_details2 = " decompression_failure";
-					break;
-				case 40:
-					str_details2 = " handshake_failure";
-					break;
-				case 42:
-					str_details2 = " bad_certificate";
-					break;
-				case 43:
-					str_details2 = " unsupported_certificate";
-					break;
-				case 44:
-					str_details2 = " certificate_revoked";
-					break;
-				case 45:
-					str_details2 = " certificate_expired";
-					break;
-				case 46:
-					str_details2 = " certificate_unknown";
-					break;
-				case 47:
-					str_details2 = " illegal_parameter";
-					break;
-				case 48:
-					str_details2 = " unknown_ca";
-					break;
-				case 49:
-					str_details2 = " access_denied";
-					break;
-				case 50:
-					str_details2 = " decode_error";
-					break;
-				case 51:
-					str_details2 = " decrypt_error";
-					break;
-				case 60:
-					str_details2 = " export_restriction";
-					break;
-				case 70:
-					str_details2 = " protocol_version";
-					break;
-				case 71:
-					str_details2 = " insufficient_security";
-					break;
-				case 80:
-					str_details2 = " internal_error";
-					break;
-				case 90:
-					str_details2 = " user_canceled";
-					break;
-				case 100:
-					str_details2 = " no_renegotiation";
-					break;
-				}
+				str_details2 = lookup((int)bp[1], alert_types, " ???");
 			}
-		}
-		
-		if (content_type == 22) /* Handshake */
-		{
+			break;
+		case SSL3_RT_HANDSHAKE:
+			/* type 22 */
+			str_content_type = ", Handshake";
 			str_details1 = "???";
-
 			if (len > 0)
-			{
-				switch (((unsigned char*)buf)[0])
-				{
-				case 0:
-					str_details1 = ", HelloRequest";
-					break;
-				case 1:
-					str_details1 = ", ClientHello";
-					break;
-				case 2:
-					str_details1 = ", ServerHello";
-					break;
-				case 11:
-					str_details1 = ", Certificate";
-					break;
-				case 12:
-					str_details1 = ", ServerKeyExchange";
-					break;
-				case 13:
-					str_details1 = ", CertificateRequest";
-					break;
-				case 14:
-					str_details1 = ", ServerHelloDone";
-					break;
-				case 15:
-					str_details1 = ", CertificateVerify";
-					break;
-				case 16:
-					str_details1 = ", ClientKeyExchange";
-					break;
-				case 20:
-					str_details1 = ", Finished";
-					break;
-				}
-			}
+				str_details1 = lookup((int)bp[0], handshakes, "???");
+			break;
+		case SSL3_RT_APPLICATION_DATA:
+			/* type 23 */
+			str_content_type = ", ApplicationData";
+			break;
+		case SSL3_RT_HEADER:
+			/* type 256 */
+			str_content_type = ", RecordHeader";
+			break;
+		case SSL3_RT_INNER_CONTENT_TYPE:
+			/* type 257 */
+			str_content_type = ", InnerContent";
+			break;
+		default:
+			BIO_snprintf(tmpbuf, sizeof(tmpbuf) - 1, ", Unknown (content_type=%d)", content_type);
+			str_content_type = tmpbuf;
 		}
+	}
+	else {
+		BIO_snprintf(tmpbuf, sizeof(tmpbuf) - 1, "Not TLS data or unknown version (version=%d, content_type=%d)", version, content_type);
+		str_version = tmpbuf;
 	}
 
 	loggerM_ptr->text(LOG_DEBUG, 1, "%s %s%s [length %04lx]%s%s", str_write_p, str_version, 
@@ -1900,5 +2007,25 @@ void TLS_SOCKET_CLASS::openSslError(const char *format_ptr, ...)
 	va_end(arguments);
 	
 	openSslM_ptr->printError(loggerM_ptr, LOG_ERROR, "%s", buffer);
+}
+
+void TLS_SOCKET_CLASS::openSslInfo(const char* format_ptr, ...)
+
+//  DESCRIPTION     : Generate an error message for the current Open SSL error.
+//  PRECONDITIONS   :
+//  POSTCONDITIONS  :
+//  EXCEPTIONS      : 
+//  NOTES           : 
+//<<===========================================================================
+{
+	va_list	arguments;
+	char buffer[1024];
+
+	// handle the variable arguments
+	va_start(arguments, format_ptr);
+	vsprintf(buffer, format_ptr, arguments);
+	va_end(arguments);
+
+	openSslM_ptr->printError(loggerM_ptr, LOG_INFO, "%s", buffer);
 }
 
